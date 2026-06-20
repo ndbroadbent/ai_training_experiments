@@ -1,0 +1,6 @@
+/target
+/data/*.jsonl
+!/data/seed_examples.jsonl
+/checkpoints/**/*.log
+/checkpoints/**/*.mpk
+/checkpoints/**/tokenizer.json

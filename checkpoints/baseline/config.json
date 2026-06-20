@@ -1,0 +1,9 @@
+{
+  "vocab_size": 975,
+  "n_layer": 6,
+  "n_head": 6,
+  "d_model": 384,
+  "block_size": 256,
+  "dropout": 0.1,
+  "ff_mult": 4
+}

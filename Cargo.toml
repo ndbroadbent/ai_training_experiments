@@ -1,0 +1,28 @@
+[package]
+name = "ai_training"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Toy RISC-style language-model experiments in Rust + Burn"
+
+[dependencies]
+# Deep learning framework. Pinned to 0.20.1 because 0.21 requires Rust 1.92
+# and the local toolchain is 1.89. CPU (ndarray) is always available;
+# the GPU (wgpu -> Metal) backend is gated behind the `gpu` feature.
+burn = { version = "0.20.1", features = ["autodiff", "ndarray"] }
+walkdir = "2.5"      # recursive vault traversal
+regex = "1.12"       # markdown / frontmatter cleanup
+anyhow = "1"         # ergonomic error handling
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"     # save/load tokenizer + config
+rand = "0.8"         # batch sampling + multinomial token sampling
+
+[features]
+default = []
+# Enable the Metal GPU backend: `cargo run --features gpu -- <cmd>`
+gpu = ["burn/wgpu"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
