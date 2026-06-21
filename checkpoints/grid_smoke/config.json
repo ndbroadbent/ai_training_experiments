@@ -1,0 +1,14 @@
+{
+  "vocab_size": 975,
+  "n_layer": 2,
+  "n_head": 2,
+  "d_model": 96,
+  "block_size": 64,
+  "dropout": 0.1,
+  "ff_mult": 4,
+  "use_grid": true,
+  "grid_dims": 3,
+  "grid_side": 3,
+  "grid_channels": 6,
+  "grid_iters": 2
+}

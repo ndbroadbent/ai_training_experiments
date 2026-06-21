@@ -116,7 +116,7 @@ fn sample_multinomial(probs: &[f32], rng: &mut impl Rng) -> usize {
 
 /// If `s` ends with a complete, paren-balanced `>>tool:calculate(<expr>)`,
 /// return `<expr>`. Used to intercept a tool call the instant it's emitted.
-fn pending_tool_call(s: &str) -> Option<String> {
+pub(crate) fn pending_tool_call(s: &str) -> Option<String> {
     let marker = ">>tool:calculate(";
     let open = s.rfind(marker)? + marker.len();
     let mut depth = 1i32;

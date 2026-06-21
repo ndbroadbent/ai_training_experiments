@@ -6,7 +6,7 @@
   "block_size": 256,
   "dropout": 0.1,
   "ff_mult": 4,
-  "use_grid": false,
+  "use_grid": true,
   "grid_dims": 5,
   "grid_side": 3,
   "grid_channels": 6,

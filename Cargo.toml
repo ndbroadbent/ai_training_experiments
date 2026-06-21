@@ -17,6 +17,8 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"     # save/load tokenizer + config
 rand = "0.8"         # batch sampling + multinomial token sampling
+image = { version = "0.25", default-features = false, features = ["png"] } # viz frames
+ab_glyph = "0.2"     # font rasterization for viz labels
 
 [features]
 default = []

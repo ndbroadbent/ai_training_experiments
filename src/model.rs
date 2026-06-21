@@ -10,6 +10,7 @@ use burn::nn::{
     Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear,
     LinearConfig,
 };
+use burn::module::Ignored;
 use burn::prelude::*;
 use burn::tensor::activation::{gelu, softmax};
 
@@ -32,6 +33,24 @@ pub struct ModelConfig {
     /// to shrink the feed-forward layers where factual memory tends to live.
     #[config(default = 4)]
     pub ff_mult: usize,
+
+    // --- Experimental N-D neuron-grid block (replaces the FFN when enabled) ---
+    /// Use the grid block instead of the MLP feed-forward layer.
+    #[config(default = false)]
+    pub use_grid: bool,
+    /// Lattice dimensionality (3 = cube, 5 = your 5D idea).
+    #[config(default = 5)]
+    pub grid_dims: usize,
+    /// Cells per axis. Total cells = grid_side ^ grid_dims. Use >=4 for true
+    /// locality; side 3 makes every cell a neighbor of every other.
+    #[config(default = 3)]
+    pub grid_side: usize,
+    /// Feature channels per cell. Pick so cells*channels ~= ff_mult*d_model.
+    #[config(default = 6)]
+    pub grid_channels: usize,
+    /// Number of local-update iterations (the "depth" of the grid).
+    #[config(default = 3)]
+    pub grid_iters: usize,
 }
 
 impl ModelConfig {
@@ -42,9 +61,7 @@ impl ModelConfig {
             self.d_model,
             self.n_head
         );
-        let blocks = (0..self.n_layer)
-            .map(|_| Block::new(self.d_model, self.n_head, self.ff_mult, self.dropout, device))
-            .collect();
+        let blocks = (0..self.n_layer).map(|_| Block::new(self, device)).collect();
         Model {
             tok_emb: EmbeddingConfig::new(self.vocab_size, self.d_model).init(device),
             pos_emb: EmbeddingConfig::new(self.block_size, self.d_model).init(device),
@@ -90,6 +107,40 @@ impl<B: Backend> Model<B> {
         let x = self.ln_f.forward(x);
         self.head.forward(x) // [b, t, vocab]
     }
+
+    /// Like [`forward`], but also returns the residual-stream activation vector
+    /// for the *last* position after each layer: `[embedding, block_1, ...,
+    /// block_n, final_norm]`. Used by the visualizer to watch the net "fire".
+    pub fn forward_capture(&self, idx: Tensor<B, 2, Int>) -> (Tensor<B, 3>, Vec<Vec<f32>>) {
+        let [_, t] = idx.dims();
+        let device = idx.device();
+
+        let tok = self.tok_emb.forward(idx);
+        let pos = Tensor::<B, 1, Int>::arange(0..t as i64, &device).reshape([1, t]);
+        let mut x = tok + self.pos_emb.forward(pos);
+
+        let mut acts = vec![last_row(&x)];
+        let mask = causal_mask::<B>(t, &device);
+        for block in &self.blocks {
+            x = block.forward(x, mask.clone());
+            acts.push(last_row(&x));
+        }
+        let x = self.ln_f.forward(x);
+        acts.push(last_row(&x));
+        (self.head.forward(x), acts)
+    }
+}
+
+/// Extract the last-position feature vector of a `[batch, seq, d]` tensor as a
+/// host `Vec<f32>`.
+fn last_row<B: Backend>(x: &Tensor<B, 3>) -> Vec<f32> {
+    let [_, t, d] = x.dims();
+    x.clone()
+        .slice([0..1, t - 1..t, 0..d])
+        .reshape([d])
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap()
 }
 
 #[derive(Module, Debug)]
@@ -97,24 +148,178 @@ struct Block<B: Backend> {
     ln1: LayerNorm<B>,
     attn: SelfAttention<B>,
     ln2: LayerNorm<B>,
-    mlp: Mlp<B>,
+    // Exactly one of these is populated, chosen by `config.use_grid`.
+    mlp: Option<Mlp<B>>,
+    grid: Option<GridBlock<B>>,
 }
 
 impl<B: Backend> Block<B> {
-    fn new(d_model: usize, n_head: usize, ff_mult: usize, dropout: f64, device: &B::Device) -> Self {
+    fn new(config: &ModelConfig, device: &B::Device) -> Self {
+        let (mlp, grid) = if config.use_grid {
+            (None, Some(GridBlock::new(config, device)))
+        } else {
+            let mlp = Mlp::new(config.d_model, config.ff_mult, config.dropout, device);
+            (Some(mlp), None)
+        };
         Self {
-            ln1: LayerNormConfig::new(d_model).init(device),
-            attn: SelfAttention::new(d_model, n_head, dropout, device),
-            ln2: LayerNormConfig::new(d_model).init(device),
-            mlp: Mlp::new(d_model, ff_mult, dropout, device),
+            ln1: LayerNormConfig::new(config.d_model).init(device),
+            attn: SelfAttention::new(config.d_model, config.n_head, config.dropout, device),
+            ln2: LayerNormConfig::new(config.d_model).init(device),
+            mlp,
+            grid,
         }
     }
 
     fn forward(&self, x: Tensor<B, 3>, mask: Tensor<B, 4>) -> Tensor<B, 3> {
-        // Pre-norm residual blocks (GPT-2 style).
+        // Pre-norm residual blocks (GPT-2 style). The feed-forward sublayer is
+        // either the standard MLP or the experimental grid block.
         let x = x.clone() + self.attn.forward(self.ln1.forward(x), mask);
-        x.clone() + self.mlp.forward(self.ln2.forward(x))
+        let normed = self.ln2.forward(x.clone());
+        let ff = match &self.mlp {
+            Some(mlp) => mlp.forward(normed),
+            None => self.grid.as_ref().expect("mlp or grid must be set").forward(normed),
+        };
+        x + ff
     }
+}
+
+/// Experimental feed-forward replacement: an N-dimensional lattice of cells with
+/// Moore connectivity (orthogonal + diagonal + cross-dimension neighbors). A
+/// token's vector is projected into the grid, the cells update from their
+/// neighbors for `iters` iterations (toroidal boundaries; diagonals give
+/// Chebyshev-distance mixing, so information spreads fast), then it's projected
+/// back. The lattice topology lives entirely in the (constant) adjacency matrix.
+#[derive(Module, Debug)]
+struct GridBlock<B: Backend> {
+    in_proj: Linear<B>,
+    self_lin: Linear<B>,
+    nbr_lin: Linear<B>,
+    out_proj: Linear<B>,
+    /// Row-normalized [cells, cells] neighbor matrix, flattened. Backend-agnostic
+    /// constant data; materialized into a tensor per forward (cheap for small
+    /// grids). Not a trained parameter.
+    adjacency: Ignored<Vec<f32>>,
+    num_cells: usize,
+    channels: usize,
+    iters: usize,
+}
+
+impl<B: Backend> GridBlock<B> {
+    fn new(config: &ModelConfig, device: &B::Device) -> Self {
+        let dims = config.grid_dims;
+        let side = config.grid_side;
+        let channels = config.grid_channels;
+        let num_cells = side.pow(dims as u32);
+        let state = num_cells * channels;
+        Self {
+            in_proj: LinearConfig::new(config.d_model, state).init(device),
+            self_lin: LinearConfig::new(channels, channels).init(device),
+            nbr_lin: LinearConfig::new(channels, channels).init(device),
+            out_proj: LinearConfig::new(state, config.d_model).init(device),
+            adjacency: Ignored(moore_adjacency_data(dims, side)),
+            num_cells,
+            channels,
+            iters: config.grid_iters,
+        }
+    }
+
+    fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [b, t, d] = x.dims();
+        let m = b * t;
+        // Project each token vector into a grid state [tokens, cells, channels].
+        let mut s = self
+            .in_proj
+            .forward(x.reshape([m, d]))
+            .reshape([m, self.num_cells, self.channels]);
+
+        for _ in 0..self.iters {
+            let agg = self.aggregate(s.clone());
+            // Each cell mixes its own state with the mean of its neighbors.
+            let update = gelu(self.self_lin.forward(s.clone()) + self.nbr_lin.forward(agg));
+            s = s + update;
+        }
+
+        self.out_proj
+            .forward(s.reshape([m, self.num_cells * self.channels]))
+            .reshape([b, t, d])
+    }
+
+    /// Mean of each cell's neighbors, as `adjacency @ state` over the cell axis.
+    fn aggregate(&self, s: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [m, nc, c] = s.dims();
+        let device = s.device();
+        let a = Tensor::<B, 2>::from_data(TensorData::new(self.adjacency.0.clone(), [nc, nc]), &device);
+        let s_perm = s.swap_dims(0, 1).reshape([nc, m * c]); // [cells, tokens*channels]
+        let agg = a.matmul(s_perm); // [cells, tokens*channels]
+        agg.reshape([nc, m, c]).swap_dims(0, 1) // [tokens, cells, channels]
+    }
+}
+
+/// Build a row-normalized Moore-neighborhood adjacency matrix for a `dims`-D
+/// lattice with `side` cells per axis and toroidal (wrap-around) boundaries.
+/// Each cell connects to all cells differing by -1/0/+1 per axis (excluding
+/// itself): orthogonal, diagonal, and across dimensions.
+fn moore_adjacency_data(dims: usize, side: usize) -> Vec<f32> {
+    let nc = side.pow(dims as u32);
+    let offsets = moore_offsets(dims);
+    let mut a = vec![0f32; nc * nc];
+
+    for i in 0..nc {
+        let coords = decode(i, dims, side);
+        for off in &offsets {
+            let neighbor: Vec<usize> = (0..dims)
+                .map(|d| (coords[d] as i64 + off[d]).rem_euclid(side as i64) as usize)
+                .collect();
+            let j = encode(&neighbor, side);
+            if j != i {
+                a[i * nc + j] += 1.0;
+            }
+        }
+        let sum: f32 = a[i * nc..(i + 1) * nc].iter().sum();
+        if sum > 0.0 {
+            for v in &mut a[i * nc..(i + 1) * nc] {
+                *v /= sum;
+            }
+        }
+    }
+    a
+}
+
+/// All offset vectors in {-1,0,1}^dims except the all-zero (self) vector.
+fn moore_offsets(dims: usize) -> Vec<Vec<i64>> {
+    let mut result = vec![vec![]];
+    for _ in 0..dims {
+        result = result
+            .into_iter()
+            .flat_map(|prefix| {
+                [-1i64, 0, 1].into_iter().map(move |v| {
+                    let mut p = prefix.clone();
+                    p.push(v);
+                    p
+                })
+            })
+            .collect();
+    }
+    result.into_iter().filter(|o| o.iter().any(|&x| x != 0)).collect()
+}
+
+fn decode(mut i: usize, dims: usize, side: usize) -> Vec<usize> {
+    let mut coords = vec![0; dims];
+    for c in coords.iter_mut() {
+        *c = i % side;
+        i /= side;
+    }
+    coords
+}
+
+fn encode(coords: &[usize], side: usize) -> usize {
+    let mut idx = 0;
+    let mut stride = 1;
+    for &c in coords {
+        idx += c * stride;
+        stride *= side;
+    }
+    idx
 }
 
 #[derive(Module, Debug)]

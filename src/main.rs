@@ -13,6 +13,7 @@ mod sample;
 mod sft;
 mod tools;
 mod train;
+mod viz;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -62,6 +63,17 @@ enum Command {
         eval_every: usize,
         #[arg(long = "eval-iters", default_value_t = 50)]
         eval_iters: usize,
+        /// Use the experimental N-D neuron-grid block instead of the MLP.
+        #[arg(long = "use-grid")]
+        use_grid: bool,
+        #[arg(long = "grid-dims", default_value_t = 5)]
+        grid_dims: usize,
+        #[arg(long = "grid-side", default_value_t = 3)]
+        grid_side: usize,
+        #[arg(long = "grid-channels", default_value_t = 6)]
+        grid_channels: usize,
+        #[arg(long = "grid-iters", default_value_t = 3)]
+        grid_iters: usize,
     },
     /// Generate the synthetic training dataset (calculator + cloze + seed).
     GenData {
@@ -152,6 +164,27 @@ enum Command {
         #[arg(long, default_value_t = 0.7)]
         temperature: f64,
     },
+    /// Render an mp4 of the network firing as it answers a query.
+    Viz {
+        #[arg(long, default_value = "checkpoints/risc")]
+        dir: String,
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long = "no-retrieve")]
+        no_retrieve: bool,
+        #[arg(long = "top-k", default_value_t = 3)]
+        top_k: usize,
+        #[arg(long = "chunk-words", default_value_t = 60)]
+        chunk_words: usize,
+        #[arg(long = "max-new", default_value_t = 160)]
+        max_new: usize,
+        #[arg(long, default_value = "viz.mp4")]
+        out: String,
+        #[arg(long, default_value_t = 10)]
+        fps: usize,
+    },
     /// Generate text from a trained checkpoint.
     Sample {
         /// Checkpoint directory (as passed to `train --out`).
@@ -191,6 +224,11 @@ fn main() -> Result<()> {
             dropout,
             eval_every,
             eval_iters,
+            use_grid,
+            grid_dims,
+            grid_side,
+            grid_channels,
+            grid_iters,
         } => {
             train::run_train(train::Params {
                 notes: notes.unwrap_or_else(default_notes),
@@ -205,6 +243,11 @@ fn main() -> Result<()> {
                 dropout,
                 eval_every,
                 eval_iters,
+                use_grid,
+                grid_dims,
+                grid_side,
+                grid_channels,
+                grid_iters,
             })?;
         }
         Command::GenData {
@@ -290,6 +333,29 @@ fn main() -> Result<()> {
                 chunk_words,
                 max_new,
                 temperature,
+            })?;
+        }
+        Command::Viz {
+            dir,
+            query,
+            notes,
+            no_retrieve,
+            top_k,
+            chunk_words,
+            max_new,
+            out,
+            fps,
+        } => {
+            viz::run_viz(viz::Params {
+                dir,
+                query,
+                notes: notes.unwrap_or_else(default_notes),
+                retrieve: !no_retrieve,
+                top_k,
+                chunk_words,
+                max_new,
+                out,
+                fps,
             })?;
         }
         Command::Sample {

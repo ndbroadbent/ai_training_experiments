@@ -30,6 +30,11 @@ pub struct Params {
     pub dropout: f64,
     pub eval_every: usize,
     pub eval_iters: usize,
+    pub use_grid: bool,
+    pub grid_dims: usize,
+    pub grid_side: usize,
+    pub grid_channels: usize,
+    pub grid_iters: usize,
 }
 
 pub fn run_train(p: Params) -> Result<()> {
@@ -54,7 +59,12 @@ pub fn run_train(p: Params) -> Result<()> {
         .with_n_head(p.n_head)
         .with_d_model(p.d_model)
         .with_block_size(p.block)
-        .with_dropout(p.dropout);
+        .with_dropout(p.dropout)
+        .with_use_grid(p.use_grid)
+        .with_grid_dims(p.grid_dims)
+        .with_grid_side(p.grid_side)
+        .with_grid_channels(p.grid_channels)
+        .with_grid_iters(p.grid_iters);
     let mut model: Model<B> = config.init(&device);
     println!(
         "Model: {} layers, {} heads, d_model {}, block {}  ->  {} params",
@@ -64,6 +74,13 @@ pub fn run_train(p: Params) -> Result<()> {
         p.block,
         model.num_params()
     );
+    if p.use_grid {
+        let cells = p.grid_side.pow(p.grid_dims as u32);
+        println!(
+            "Feed-forward: {}D grid, side {}, {} cells x {} channels, {} iters",
+            p.grid_dims, p.grid_side, cells, p.grid_channels, p.grid_iters
+        );
+    }
 
     let mut optim = AdamWConfig::new().init();
 

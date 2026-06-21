@@ -4,3 +4,5 @@
 /checkpoints/**/*.log
 /checkpoints/**/*.mpk
 /checkpoints/**/tokenizer.json
+*.mp4
+viz_frames/

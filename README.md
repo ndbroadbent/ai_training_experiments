@@ -17,6 +17,11 @@ from its weights. Knowledge lives *outside* the model and is fetched on demand.
 This mirrors real research — RETRO, Toolformer, kNN-LM, and the finding that
 transformer feed-forward layers are key-value fact stores.
 
+> **Reality check learned the hard way:** you can't externalize *everything*.
+> Reasoning, grammar, and language understanding have to live in the weights —
+> the model can't even parse a question without them. "Externalize facts" works;
+> "externalize knowledge" doesn't, because reasoning rides on absorbed knowledge.
+
 Two concrete embodiments:
 
 - **Calculator tool.** The model emits `>>tool:calculate(2334*9834)`; the runtime
@@ -61,14 +66,7 @@ Q: What is 2334 times 9834?
 A: >>tool:calculate(2334*9834)
    >>tool:result(22952556)        ← evaluated by the Rust evaluator, injected
    2334 times 9834 is 22952556.   ✓
-
-$ ask --no-retrieve --query "What is 87654 minus 12345?"
-A: >>tool:calculate(87654-12345)
-   >>tool:result(75309)
-   The answer is 75309.           ✓
 ```
-
-### What works / what doesn't (honest scorecard)
 
 | Capability | Status | Notes |
 |---|---|---|
@@ -79,8 +77,45 @@ A: >>tool:calculate(87654-12345)
 | Grounded retrieval QA | ❌ weak | train/test mismatch + thin data + 256-char window |
 
 Every *engineering* piece works (masked SFT, tool-loop, retrieval, format). The
-failures are **data + scale**, not architecture — fixable with more diverse
-training data and a larger context window (see Roadmap).
+failures are **data + scale**, not architecture.
+
+### Experimental 5D neuron-grid (vs. the MLP)
+
+Each transformer block's feed-forward layer can be swapped (`--use-grid`) for an
+**N-dimensional Moore-connected lattice**: a token's vector is projected into a
+grid of cells that update from their neighbors — orthogonal, diagonal, and
+cross-dimension (diagonals give Chebyshev-distance mixing, so signal spreads
+fast) — for several iterations, then projected back. The topology lives in a
+constant adjacency matrix, so 3D→5D is just a flag.
+
+First run: a 5D grid (243 cells × 6 channels, 3 iterations), parameter-matched to
+the MLP (11.13M vs 11.49M), same 6L/384/256 transformer, 1,000 steps:
+
+| step | baseline MLP (val) | 5D-grid (val) |
+|---|---|---|
+| 200 | 2.63 | 2.64 |
+| 600 | 2.33 | 2.47 |
+| 1000 | **2.00** | **2.15** |
+
+**Takeaway:** the grid learns language at near-MLP rate and the gap *stabilizes*
+at ~0.15 nats — a hand-built neuron lattice is in the same league as the FFN that
+powers every production transformer, at equal parameters. It doesn't beat it
+(and underfits, so there's headroom). Caveat: `side=3` is the *dense-mixing*
+regime (every cell neighbors every other), so this run doesn't yet test true
+locality (`side≥4`) — the most interesting part of the idea.
+
+## Visualization
+
+`viz` renders an **mp4 of the network firing as it answers a query**: per emitted
+token it captures the residual-stream activations after every layer and draws a
+frame — a layer×channel heatmap, the live output text (including the tool-loop),
+and the top-k next-token distribution. Pure-Rust frames (`image` + `ab_glyph`),
+encoded to mp4 with ffmpeg.
+
+```sh
+cargo run -- viz --dir checkpoints/risc --no-retrieve \
+  --query "What is 2334 times 9834?" --out viz.mp4
+```
 
 ## How it works
 
@@ -92,17 +127,20 @@ training data and a larger context window (see Roadmap).
   builds either one corpus (for pretraining) or chunks with provenance (for RAG).
 - **SFT format** — examples render to a flat sequence with sentinel markers
   (`<|context|> <|question|> <|answer|> <|end|>`) and inline tool calls.
+- **Grid block** — a drop-in feed-forward replacement; dimensionality, side,
+  channels, and iterations are all hyperparameters.
 
 ## Project layout
 
 ```
 src/
-  main.rs         CLI (hello, data, gen-data, retrieve, train, train-sft, ask, sample)
+  main.rs         CLI (hello, data, gen-data, retrieve, train, train-sft, ask, viz, sample)
   backend.rs      CPU / Metal backend selection
-  model.rs        decoder-only transformer (configurable FFN width)
+  model.rs        decoder-only transformer (MLP or N-D grid feed-forward)
   train.rs        baseline pretraining loop
   sft.rs          masked-loss supervised fine-tuning
   sample.rs       generation + the calculator tool-loop + `ask`
+  viz.rs          mp4 "brain-scan" of the net firing during generation
   retrieval.rs    hand-rolled BM25 index
   tools/calculator.rs   recursive-descent arithmetic evaluator (+ tests)
   data/           corpus cleaning, char tokenizer, example format, synth generators
@@ -127,6 +165,10 @@ cargo run -- gen-data --calc 3000 --cloze 3000
 # Pretrain the baseline transformer (GPU recommended)
 cargo run --features gpu --release -- train --steps 2000 --out checkpoints/baseline
 
+# ... or pretrain with the experimental 5D neuron-grid feed-forward
+cargo run --features gpu --release -- train --use-grid --grid-dims 5 --grid-side 3 \
+  --grid-channels 6 --grid-iters 3 --out checkpoints/grid5d
+
 # Fine-tune the RISC model from the baseline
 cargo run --features gpu --release -- train-sft --init checkpoints/baseline --out checkpoints/risc
 
@@ -136,6 +178,9 @@ cargo run --features gpu --release -- ask --dir checkpoints/risc --no-retrieve \
 
 # ... or grounded in retrieved notes
 cargo run --features gpu --release -- ask --dir checkpoints/risc --query "<question about your notes>"
+
+# Visualize the network firing as it answers (-> viz.mp4)
+cargo run -- viz --dir checkpoints/risc --no-retrieve --query "What is 2334 times 9834?"
 
 # Free-form sampling from any checkpoint
 cargo run --features gpu --release -- sample --dir checkpoints/baseline --prompt "Chess is"
@@ -151,18 +196,18 @@ cargo run --features gpu --release -- sample --dir checkpoints/baseline --prompt
 | 4 | BM25 retrieval | ✅ |
 | 5 | Synthetic data (calculator + cloze + seed) | ✅ |
 | 6 | RISC model + calculator tool-loop | ✅ |
-| 7 | Experimental N-D neuron-grid block | ⏳ planned |
+| 7 | Experimental N-D neuron-grid block | ✅ |
+| + | Generation visualizer (mp4) | ✅ |
 
-**Next up:**
+**Open follow-ups:**
+- **Grid locality** — a `side≥4` run (true Moore neighborhoods, not dense mixing)
+  and a sweep of `grid-iters` / `grid-channels` to see if either closes the
+  ~0.15-nat gap to the MLP.
 - **Better Q&A** — more diverse, natural-question grounded examples; retrain the
   baseline at block 512–1024 (the 256-char window is the main RAG bottleneck);
   optionally BPE + vocab pruning.
-- **Task 7 — the neuron grid.** Replace the transformer's feed-forward block with
-  a high-dimensional *Moore-connected lattice* (orthogonal + diagonal + cross-dim
-  neighbors) whose cells update iteratively — a 3D→5D "grid-as-block" experiment,
-  compared head-to-head against the baseline FFN at matched parameters.
 
 ## Requirements
 
-Rust 1.89+, and an Apple Silicon Mac for the Metal backend (CPU works anywhere).
-Built with Burn 0.20.1.
+Rust 1.89+, an Apple Silicon Mac for the Metal backend (CPU works anywhere), and
+`ffmpeg` for the `viz` command. Built with Burn 0.20.1.
